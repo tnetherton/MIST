@@ -16,12 +16,75 @@ import ants
 import pandas as pd
 import numpy as np
 import rich
+from joblib import Parallel, delayed
 
 # MIST imports.
 from mist.utils import io, progress_bar
 from mist.preprocessing import preprocessing_utils
 from mist.analyze_data import analyzer_utils
 from mist.analyze_data.analyzer_constants import AnalyzeConstants as constants
+
+def _compute_fg_bbox_for_patient(patient: dict):
+    """Compute FG bbox, cropped dims, and volume reduction for one patient."""
+    image_list = list(patient.values())[3:len(patient)]
+    image = ants.image_read(image_list[0])
+    fg_bbox = preprocessing_utils.get_fg_mask_bbox(image)
+    cropped_dims_i = [
+        fg_bbox["x_end"] - fg_bbox["x_start"] + 1,
+        fg_bbox["y_end"] - fg_bbox["y_start"] + 1,
+        fg_bbox["z_end"] - fg_bbox["z_start"] + 1,
+    ]
+    vol_reduction_i = 1.0 - (np.prod(cropped_dims_i) / np.prod(image.shape))
+    fg_bbox_with_id = dict(fg_bbox)
+    fg_bbox_with_id["id"] = patient["id"]
+    return fg_bbox_with_id, cropped_dims_i, vol_reduction_i
+
+def _nz_ratio_for_patient(patient: dict) -> float:
+    """Compute non-zero voxel ratio for one patient's first image."""
+    image_list = list(patient.values())[3:len(patient)]
+    image = ants.image_read(image_list[0])
+    return float(np.sum(image.numpy() != 0) / np.prod(image.shape))
+
+def _mask_spacing(mask_path: str):
+    """Load mask and return spacing tuple in RAI orientation."""
+    mask = ants.image_read(mask_path)
+    mask = ants.reorient_image2(mask, "RAI")
+    mask.set_direction(constants.RAI_ANTS_DIRECTION)
+    return tuple(mask.spacing)
+
+def _resampled_dims_and_msg(
+    patient: dict,
+    current_dims_i,
+    target_spacing,
+    n_labels: int,
+):
+    """Compute resampled dims and optional warning message for one patient."""
+    mask_header = ants.image_header_info(patient["mask"])
+    image_list = list(patient.values())[3:len(patient)]
+    current_spacing = mask_header["spacing"]
+    new_dims = analyzer_utils.get_resampled_image_dimensions(
+        current_dims_i, current_spacing, target_spacing
+    )
+    image_memory_size = analyzer_utils.get_float32_example_memory_size(
+        new_dims, len(image_list), n_labels
+    )
+    msg = None
+    if image_memory_size > constants.MAX_RECOMMENDED_MEMORY_SIZE:
+        msg = (
+            f"[yellow][Warning] In {patient['id']}: Resampled example "
+            f"is larger than the recommended memory size of "
+            f"{constants.MAX_RECOMMENDED_MEMORY_SIZE/1e9} GB. "
+            "Consider coarsening or removing this example.[/yellow]"
+        )
+    return new_dims, msg
+
+def _patient_ct_fg_intensities(patient: dict):
+    """Return a downsampled list of CT intensities within the foreground mask."""
+    image_list = list(patient.values())[3:len(patient)]
+    image = ants.image_read(image_list[0])
+    mask = ants.image_read(patient["mask"])
+    # Downsample intensities to reduce memory
+    return (image[mask != 0]).tolist()[::constants.CT_GATHER_EVERY_ITH_VOXEL_VALUE]  # type: ignore
 
 
 class Analyzer:
@@ -69,6 +132,17 @@ class Analyzer:
                 "[yellow]Overwriting existing configuration at "
                 f"{self.config_json}[/yellow]"
             )
+        # Configure analyze parallelism from CLI if provided; default is 1.
+        # Persist it into the config so it is saved in config.json.
+        if getattr(self.mist_arguments, "num_workers_analyze", None) is not None:
+            try:
+                self.config["num_workers_analyze"] = int(
+                    self.mist_arguments.num_workers_analyze
+                )
+            except Exception:
+                self.config["num_workers_analyze"] = 1
+        else:
+            self.config.setdefault("num_workers_analyze", 1)
 
     def _check_dataset_info(self):
         """Check if the dataset description file is in the correct format.
@@ -225,51 +299,23 @@ class Analyzer:
         """
         progress = progress_bar.get_progress_bar("Checking FG vol. reduction")
 
-        fg_bboxes_df = pd.DataFrame(
-            columns=[
-                "id",
-                "x_start",
-                "x_end",
-                "y_start",
-                "y_end",
-                "z_start",
-                "z_end",
-                "x_og_size",
-                "y_og_size",
-                "z_og_size",
-            ]
-        )
-
-        vol_reduction = []
+        n_jobs = int(self.config.get("num_workers_analyze", 1))
         cropped_dims = np.zeros((len(self.paths_df), 3))
         with progress as pb:
-            for i in pb.track(range(len(self.paths_df))):
-                patient = self.paths_df.iloc[i].to_dict()
-                image_list = list(patient.values())[3:len(patient)]
-
-                # Read original images.
-                image = ants.image_read(image_list[0])
-
-                # Get foreground mask and save it to save computation time.
-                fg_bbox = preprocessing_utils.get_fg_mask_bbox(image)
-
-                # Get cropped dimensions from bounding box.
-                cropped_dims[i, :] = [
-                    fg_bbox["x_end"] - fg_bbox["x_start"] + 1,
-                    fg_bbox["y_end"] - fg_bbox["y_start"] + 1,
-                    fg_bbox["z_end"] - fg_bbox["z_start"] + 1,
-                ]
-
-                vol_reduction.append(
-                    1. - (np.prod(cropped_dims[i, :]) / np.prod(image.shape))
+            results = Parallel(n_jobs=n_jobs)(
+                delayed(_compute_fg_bbox_for_patient)(
+                    self.paths_df.iloc[i].to_dict()
                 )
-
-                # Update bounding box dataframe with foreground bounding box.
-                fg_bbox["id"] = patient["id"]
-                fg_bboxes_df = pd.concat(
-                    [fg_bboxes_df, pd.DataFrame(fg_bbox, index=[0])],
-                    ignore_index=True
-                )
+                for i in pb.track(range(len(self.paths_df)))
+            )
+        # Aggregate results (preserving input order)
+        fg_bbox_records = []
+        vol_reduction = []
+        for i, (fg_bbox_i, dims_i, vol_i) in enumerate(results):
+            fg_bbox_records.append(fg_bbox_i)
+            cropped_dims[i, :] = dims_i
+            vol_reduction.append(vol_i)
+        fg_bboxes_df = pd.DataFrame(fg_bbox_records)
 
         fg_bboxes_df.to_csv(self.fg_bboxes_csv, index=False)
         crop_to_fg = (
@@ -289,19 +335,12 @@ class Analyzer:
         """
         progress = progress_bar.get_progress_bar("Checking non-zero ratio")
 
-        nz_ratio = []
+        n_jobs = int(self.config.get("num_workers_analyze", 1))
         with progress as pb:
-            for i in pb.track(range(len(self.paths_df))):
-                patient = self.paths_df.iloc[i].to_dict()
-                image_list = list(patient.values())[3:len(patient)]
-
-                # Read original images.
-                image = ants.image_read(image_list[0])
-
-                # Get nonzero ratio.
-                nz_ratio.append(
-                    np.sum(image.numpy() != 0) / np.prod(image.shape)
-                )
+            nz_ratio = Parallel(n_jobs=n_jobs)(
+                delayed(_nz_ratio_for_patient)(self.paths_df.iloc[i].to_dict())
+                for i in pb.track(range(len(self.paths_df)))
+            )
 
         use_nz_mask = (
             (1. - np.mean(nz_ratio)) >= constants.MIN_SPARSITY_FRACTION
@@ -320,22 +359,13 @@ class Analyzer:
         """
         progress = progress_bar.get_progress_bar("Getting target spacing")
 
-        # If data is anisotropic, get median image spacing.
-        original_spacings = np.zeros((len(self.paths_df), 3))
-
+        n_jobs = int(self.config.get("num_workers_analyze", 1))
         with progress as pb:
-            for i in pb.track(range(len(self.paths_df))):
-                patient = self.paths_df.iloc[i].to_dict()
-
-                # Reorient masks to RAI to collect target spacing. We do this
-                # to make sure that all of the axes in the spacings match up.
-                # We load the masks because they are smaller and faster to load.
-                mask = ants.image_read(patient["mask"])
-                mask = ants.reorient_image2(mask, "RAI")
-                mask.set_direction(constants.RAI_ANTS_DIRECTION)
-
-                # Get voxel spacing.
-                original_spacings[i, :] = mask.spacing
+            spacings = Parallel(n_jobs=n_jobs)(
+                delayed(_mask_spacing)(self.paths_df.iloc[i].to_dict()["mask"])
+                for i in pb.track(range(len(self.paths_df)))
+            )
+        original_spacings = np.array(spacings, dtype=float)
 
         # Initialize target spacing.
         target_spacing = list(np.median(original_spacings, axis=0))
@@ -381,51 +411,25 @@ class Analyzer:
             "Checking resampled dimensions"
         )
         messages = []
+        crop_to_fg = bool(self.config["preprocessing"]["crop_to_foreground"])
+        tgt_spacing = self.config["preprocessing"]["target_spacing"]
+        n_labels = len(self.dataset_info["labels"])
+        n_jobs = int(self.config.get("num_workers_analyze", 1))
         with progress as pb:
-            for i in pb.track(range(len(self.paths_df))):
-                patient = self.paths_df.iloc[i].to_dict()
-                mask_header = ants.image_header_info(patient["mask"])
-                image_list = list(patient.values())[3:len(patient)]
-
-                if self.config["preprocessing"]["crop_to_foreground"]:
-                    current_dims = cropped_dims[i, :]
-                else:
-                    current_dims = mask_header["dimensions"]
-
-                current_spacing = mask_header["spacing"]
-
-                # Compute resampled dimensions.
-                new_dims = analyzer_utils.get_resampled_image_dimensions(
-                    current_dims, current_spacing,
-                    self.config["preprocessing"]["target_spacing"]
+            results = Parallel(n_jobs=n_jobs)(
+                delayed(_resampled_dims_and_msg)(
+                    self.paths_df.iloc[i].to_dict(),
+                    (cropped_dims[i, :] if crop_to_fg else
+                     ants.image_header_info(self.paths_df.iloc[i].to_dict()["mask"])["dimensions"]),
+                    tgt_spacing,
+                    n_labels,
                 )
-
-                # Compute memory size of resampled image.
-                image_memory_size = (
-                    analyzer_utils.get_float32_example_memory_size(
-                        new_dims,
-                        len(image_list),
-                        len(self.dataset_info["labels"])
-                    )
-                )
-
-                # If image memory size is larger than the max recommended size
-                # set in MAX_RECOMMENDED_MEMORY_SIZE, then warn the user and
-                # print to console.
-                if (
-                    image_memory_size > constants.MAX_RECOMMENDED_MEMORY_SIZE
-                ):
-                    print_patient_id = patient["id"]
-                    messages.append(
-                        f"[yellow][Warning] In {print_patient_id}: Resampled "
-                        "example is larger than the recommended memory size of "
-                        f"{constants.MAX_RECOMMENDED_MEMORY_SIZE/1e9} "
-                        "GB. Consider coarsening or removing this "
-                        "example.[/yellow]"
-                    )
-
-                # Collect the new resampled dimensions.
-                resampled_dims[i, :] = new_dims
+                for i in pb.track(range(len(self.paths_df)))
+            )
+        for i, (new_dims_i, msg_i) in enumerate(results):
+            resampled_dims[i, :] = new_dims_i
+            if msg_i:
+                messages.append(msg_i)
 
         if messages:
             for message in messages:
@@ -447,23 +451,14 @@ class Analyzer:
         correctly to the foreground intensities.
         """
         progress = progress_bar.get_progress_bar("Getting CT norm. params.")
-        fg_intensities = []
+        n_jobs = int(self.config.get("num_workers_analyze", 1))
         with progress as pb:
-            for i in pb.track(range(len(self.paths_df))):
-                patient = self.paths_df.iloc[i].to_dict()
-                image_list = list(patient.values())[3:len(patient)]
-
-                # Read original image.
-                image = ants.image_read(image_list[0])
-
-                # Get foreground mask and make it binary.
-                mask = ants.image_read(patient["mask"])
-
-                # Get foreground voxels in original image.
-                # You don"t need to use all of the voxels for this.
-                fg_intensities += (
-                    image[mask != 0]
-                ).tolist()[::constants.CT_GATHER_EVERY_ITH_VOXEL_VALUE] # type: ignore
+            per_patient_lists = Parallel(n_jobs=n_jobs)(
+                delayed(_patient_ct_fg_intensities)(self.paths_df.iloc[i].to_dict())
+                for i in pb.track(range(len(self.paths_df)))
+            )
+        # Aggregate in the main thread
+        fg_intensities = [v for sub in per_patient_lists for v in sub]
 
         global_z_score_mean = np.mean(fg_intensities)
         global_z_score_std = np.std(fg_intensities)

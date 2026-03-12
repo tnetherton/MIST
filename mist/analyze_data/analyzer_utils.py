@@ -216,6 +216,9 @@ def build_base_config() -> Dict[str, Any]:
     """
     return {
         "mist_version": None,
+        # Number of workers for the analyze step (joblib Parallel).
+        # 1 means serial; -1 uses all available CPU cores.
+        "num_workers_analyze": 1,
         "dataset_info": {
             "task": None,
             "modality": None,
